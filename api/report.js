@@ -52,6 +52,88 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
 function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+// מפרק את טקסט המשתתפים לשמות נקיים (שורה לכל שם)
+function parseParticipantsList(participantsText) {
+  return (participantsText || '')
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+// מחפש אם אחד מהשמות מופיע בתוך טקסט (כולל שם פרטי בלבד)
+function findNameInText(names, text) {
+  const t = String(text || '').toLowerCase();
+  for (const name of names) {
+    const parts = String(name).toLowerCase().split(/\s+/).filter(Boolean);
+    // נבדוק קודם את כל השם, ואז רק את הפרטי
+    if (parts.length > 1) {
+      const full = parts.join(' ');
+      if (t.includes(full)) return name;
+    }
+    if (parts.length > 0) {
+      const first = parts[0];
+      if (first.length >= 2 && t.includes(first)) return name;
+    }
+  }
+  return null;
+}
+
+// בונה מיפוי { originalSpeakerLabel -> humanName }
+// קודם לפי "זיהוי בטקסט" (אם מישהו אמר את שמו), ואז לפי סדר הופעה מול רשימת המשתתפים
+function buildSpeakerMap(segments, participants) {
+  const labelsOrder = []; // סדר הופעת התוויות A/B/Speaker 1...
+  const seenLabel = new Set();
+  for (const s of segments) {
+    if (!seenLabel.has(s.speaker)) {
+      seenLabel.add(s.speaker);
+      labelsOrder.push(s.speaker);
+    }
+  }
+
+  const map = {};                   // mapping תוצאה
+  const assignedNames = new Set();  // שמות שכבר שויכו
+
+  // שלב א: מיפוי לפי הופעת שם בתוך הטקסט
+  for (const s of segments) {
+    const label = s.speaker;
+    if (map[label]) continue;
+    const hit = findNameInText(participants, s.text);
+    if (hit && !assignedNames.has(hit)) {
+      map[label] = hit;
+      assignedNames.add(hit);
+    }
+  }
+
+  // שלב ב: מיפוי לפי סדר הופעה
+  let pIdx = 0;
+  for (const label of labelsOrder) {
+    if (map[label]) continue; // כבר קיבל שם בשלב א
+    // מצא את השם הבא שעדיין לא שובץ
+    while (pIdx < participants.length && assignedNames.has(participants[pIdx])) {
+      pIdx++;
+    }
+    if (pIdx < participants.length) {
+      map[label] = participants[pIdx];
+      assignedNames.add(participants[pIdx]);
+      pIdx++;
+    }
+  }
+
+  // אם נשארו תוויות בלי שם – נשאיר את התווית המקורית
+  for (const label of labelsOrder) {
+    if (!map[label]) map[label] = label;
+  }
+
+  return map;
+}
+
+// מחזיר מערך סגמנטים חדש עם שמות ממופים
+function applySpeakerMap(segments, speakerMap) {
+  return segments.map(s => ({
+    ...s,
+    speaker: speakerMap[s.speaker] || s.speaker
+  }));
+}
 
 module.exports = async function handler(req, res) {
   // CORS
