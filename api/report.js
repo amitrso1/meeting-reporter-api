@@ -1,5 +1,6 @@
-// api/report.js — גרסה עצמאית ללא require, CommonJS
+// api/report.js — גרסה עצמאית: תמלול + מיפוי דוברים + דו"ח (CommonJS)
 
+// ---------- תמלול (AssemblyAI) ----------
 async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
   const API_KEY = process.env.AIA_TRANSCRIBE_KEY;
   if (!API_KEY) throw new Error('Missing AIA_TRANSCRIBE_KEY');
@@ -11,8 +12,8 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
     headers: { authorization: API_KEY, 'content-type': 'application/json' },
     body: JSON.stringify({
       audio_url: audioUrl,
-      speaker_labels: true,
-      language_code: language,
+      speaker_labels: true,      // זיהוי דוברים
+      language_code: language,   // עברית
       punctuate: true,
       format_text: true
     })
@@ -20,7 +21,7 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
   if (!createRes.ok) throw new Error('AIA create failed: ' + (await createRes.text()));
   const { id } = await createRes.json();
 
-  // 2) Polling קצר (קבצים קצרים כדי להספיק במסגרת זמן הפונקציה)
+  // 2) Polling קצר (מתאים לקבצים קצרים ~15–60ש')
   let result, status = 'processing';
   const start = Date.now();
   while (Date.now() - start < 25000) {
@@ -49,10 +50,12 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
   };
 }
 
+// ---------- עזר: HTML ----------
 function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
-// מפרק את טקסט המשתתפים לשמות נקיים (שורה לכל שם)
+
+// ---------- עזר: רשימת משתתפים ----------
 function parseParticipantsList(participantsText) {
   return (participantsText || '')
     .split('\n')
@@ -60,12 +63,11 @@ function parseParticipantsList(participantsText) {
     .filter(Boolean);
 }
 
-// מחפש אם אחד מהשמות מופיע בתוך טקסט (כולל שם פרטי בלבד)
+// האם שם אחד מרשימת המשתתפים מופיע בטקסט (מלא או פרטי)
 function findNameInText(names, text) {
   const t = String(text || '').toLowerCase();
   for (const name of names) {
     const parts = String(name).toLowerCase().split(/\s+/).filter(Boolean);
-    // נבדוק קודם את כל השם, ואז רק את הפרטי
     if (parts.length > 1) {
       const full = parts.join(' ');
       if (t.includes(full)) return name;
@@ -78,10 +80,9 @@ function findNameInText(names, text) {
   return null;
 }
 
-// בונה מיפוי { originalSpeakerLabel -> humanName }
-// קודם לפי "זיהוי בטקסט" (אם מישהו אמר את שמו), ואז לפי סדר הופעה מול רשימת המשתתפים
+// בונה מיפוי { תווית דובר מקורית -> שם אנושי }
 function buildSpeakerMap(segments, participants) {
-  const labelsOrder = []; // סדר הופעת התוויות A/B/Speaker 1...
+  const labelsOrder = [];
   const seenLabel = new Set();
   for (const s of segments) {
     if (!seenLabel.has(s.speaker)) {
@@ -90,10 +91,10 @@ function buildSpeakerMap(segments, participants) {
     }
   }
 
-  const map = {};                   // mapping תוצאה
-  const assignedNames = new Set();  // שמות שכבר שויכו
+  const map = {};
+  const assignedNames = new Set();
 
-  // שלב א: מיפוי לפי הופעת שם בתוך הטקסט
+  // שלב א: לפי הופעת שם בטקסט
   for (const s of segments) {
     const label = s.speaker;
     if (map[label]) continue;
@@ -104,14 +105,11 @@ function buildSpeakerMap(segments, participants) {
     }
   }
 
-  // שלב ב: מיפוי לפי סדר הופעה
+  // שלב ב: לפי סדר הופעה מול רשימת המשתתפים
   let pIdx = 0;
   for (const label of labelsOrder) {
-    if (map[label]) continue; // כבר קיבל שם בשלב א
-    // מצא את השם הבא שעדיין לא שובץ
-    while (pIdx < participants.length && assignedNames.has(participants[pIdx])) {
-      pIdx++;
-    }
+    if (map[label]) continue;
+    while (pIdx < participants.length && assignedNames.has(participants[pIdx])) pIdx++;
     if (pIdx < participants.length) {
       map[label] = participants[pIdx];
       assignedNames.add(participants[pIdx]);
@@ -119,22 +117,21 @@ function buildSpeakerMap(segments, participants) {
     }
   }
 
-  // אם נשארו תוויות בלי שם – נשאיר את התווית המקורית
+  // השארת תווית מקורית למי שלא שובץ
   for (const label of labelsOrder) {
     if (!map[label]) map[label] = label;
   }
-
   return map;
 }
 
-// מחזיר מערך סגמנטים חדש עם שמות ממופים
 function applySpeakerMap(segments, speakerMap) {
-  return segments.map(s => ({
+  return (segments || []).map(s => ({
     ...s,
     speaker: speakerMap[s.speaker] || s.speaker
   }));
 }
 
+// ---------- ה־Handler הראשי ----------
 module.exports = async function handler(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -143,6 +140,7 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
+  // בדיקת בריאות: מצב דמו ומפתח
   if (req.method === 'GET') {
     try {
       const demo = String(process.env.DEMO_MODE || 'true').toLowerCase() === 'true';
@@ -167,28 +165,36 @@ module.exports = async function handler(req, res) {
       audioUrl = ''
     } = req.body || {};
 
+    // ניתן גם לשלוט בדמו דרך פרמטר ?demo=true/false אם תרצה (להוסיף בקלות)
     const demo = String(process.env.DEMO_MODE || 'true').toLowerCase() === 'true';
 
+    // --- תמלול ---
     let transcript;
     if (demo) {
       transcript = {
         text: 'שלום לכולם, נתחיל בעדכון סטטוס ותיאום לוחות זמנים.',
         segments: [
-          { start: 0.0, end: 2.5, speaker: 'דובר 1', text: 'שלום לכולם' },
-          { start: 2.6, end: 8.0, speaker: 'דובר 2', text: 'נתחיל בעדכון הסטטוס' }
+          { start: 0.0, end: 2.5, speaker: 'A', text: 'שלום לכולם' },
+          { start: 2.6, end: 8.0, speaker: 'B', text: 'נתחיל בעדכון הסטטוס' }
         ],
-        speakers: ['דובר 1', 'דובר 2']
+        speakers: ['A', 'B']
       };
     } else {
       transcript = await transcribeWithSpeakersInline({ audioUrl, language: 'he' });
     }
 
-    const attendeesManual = participants
-      ? participants.split('\n').map(s => s.trim()).filter(Boolean)
-      : [];
-    const attendeesAuto = transcript.speakers || [];
-    const attendees = Array.from(new Set([...attendeesManual, ...attendeesAuto]));
+    // --- מיפוי דוברים לשמות מהטופס (עם “חיזוק” לפי שמם בטקסט) ---
+    const participantsList = parseParticipantsList(participants);         // ["אביב", "חיים", ...]
+    const speakerMap = buildSpeakerMap(transcript.segments || [], participantsList);
+    const remappedSegments = applySpeakerMap(transcript.segments || [], speakerMap);
 
+    // רשימת נוכחים משולבת (ייחודית)
+    const attendees = Array.from(new Set([
+      ...participantsList,
+      ...Object.values(speakerMap)
+    ]));
+
+    // --- HTML דו"ח בסיסי בעברית/RTL ---
     const html = `
 <section dir="rtl" style="font-family: system-ui; line-height:1.6; max-width:860px; margin:auto;">
   <h1 style="margin:0 0 12px;">${escapeHtml(meetingTitle)} – סיכום פגישה מתאריך ${escapeHtml(meetingDate)}</h1>
@@ -198,7 +204,7 @@ module.exports = async function handler(req, res) {
 
   <h3 style="margin:12px 0 6px;">תקציר תמלול לפי דוברים${demo ? ' (דמו)' : ''}</h3>
   <div style="background:#f7f7f7; padding:10px; border-radius:8px;">
-    ${transcript.segments.map(s => `
+    ${remappedSegments.map(s => `
       <p style="margin:6px 0;"><strong>${escapeHtml(s.speaker)}:</strong> ${escapeHtml(s.text)}</p>
     `).join('')}
   </div>
@@ -216,6 +222,7 @@ module.exports = async function handler(req, res) {
   ${demo ? `<p style="font-size:0.9em; color:#666;">(מצב דמו פעיל – ללא עיבוד אמיתי)</p>` : ''}
 </section>`.trim();
 
+    // --- JSON מובנה ---
     const data = {
       title: `${meetingTitle} – ${meetingDate}`,
       attendees: attendees.map(name => ({ name })),
@@ -224,8 +231,8 @@ module.exports = async function handler(req, res) {
         { id: 2, topic: 'סטטוס', decisions: 'עדכון התקדמות', owner: '', due: '' }
       ],
       transcript: {
-        speakers: transcript.speakers,
-        segments: transcript.segments
+        speakers: attendees,               // שמות אחרי מיפוי
+        segments: remappedSegments         // כל סגמנט עם speaker ממופה
       },
       footer: { scribeName, distribution }
     };
