@@ -118,6 +118,14 @@ function buildSpeakerMap(segments, participants) {
 function applySpeakerMap(segments, speakerMap) {
   return (segments || []).map(s => ({ ...s, speaker: speakerMap[s.speaker] || s.speaker }));
 }
+function buildStructuredTranscript(segments) {
+  // הופך את הסגמנטים לשורות קצרות עם זמנים ודובר: "[00:09] חיים: ..."
+  const toTime = s => {
+    const m = Math.floor(s/60), sec = Math.round(s%60).toString().padStart(2,'0');
+    return `${m}:${sec}`;
+  };
+  return (segments || []).map(s => `[${toTime(s.start)}] ${s.speaker}: ${s.text}`).join('\n');
+}
 
 // ---------- דו״ח חכם עם LLM (OpenAI) ----------
 async function generateReportItemsLLM({ transcriptText, meetingTitle, meetingDate }) {
@@ -125,11 +133,11 @@ async function generateReportItemsLLM({ transcriptText, meetingTitle, meetingDat
   if (!key) throw new Error('Missing OPENAI_API_KEY');
 
   // חיסכון: שולחים רק פתיח עד X תווים
-  const MAX_CHARS = 6000;
+  const MAX_CHARS = 9000;
   const text = String(transcriptText || '').slice(0, MAX_CHARS);
 
-  const prompt = `
-את/ה עורך/ת דו"חות ישיבות בעברית. קלט: תמלול פגישה בעברית.
+   const prompt = `
+את/ה עורך/ת דו"חות ישיבות בעברית. קלט: תמלול מפורק לפי דוברים וזמנים.
 החזר JSON בלבד עם השדות:
 {
   "items": [
@@ -139,14 +147,19 @@ async function generateReportItemsLLM({ transcriptText, meetingTitle, meetingDat
 }
 
 הנחיות:
-- "items": 3–8 שורות תכל'ס. קצר ומדויק.
-- אם לא צוין אחראי/לו"ז – השאר "—".
-- ניסוח מקצועי, בעברית תקינה, ללא הקדמות/נימוקים נוספים.
+- הפק 3–6 פריטים תמציתיים.
+- "topic": כותרת קצרה וברורה (לא משפט שלם).
+- "decisions": מה הוחלט/מה נדרש.
+- "owner": אחראי אם הוזכר; אחרת "—".
+- "due": תאריך/טווח אם הוזכר; אחרת "—".
+- אין טקסט חופשי מעבר ל-JSON.
+
 כותרת: "${meetingTitle || ''}" | תאריך: "${meetingDate || ''}"
 
 תמלול:
 """${text}"""
 `.trim();
+
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -239,8 +252,10 @@ module.exports = async function handler(req, res) {
     let summary = '';
 
     if (llmMode && !demo) {
-      const { items: aiItems = [], summary: aiSummary = '' } =
-        await generateReportItemsLLM({ transcriptText: transcript.text, meetingTitle, meetingDate });
+      const structured = buildStructuredTranscript(remappedSegments);
+const { items: aiItems = [], summary: aiSummary = '' } =
+  await generateReportItemsLLM({ transcriptText: structured, meetingTitle, meetingDate });
+
 
       // נורמליזציה + הוספת מזהים
       items = (aiItems || []).slice(0, 8).map((it, idx) => ({
