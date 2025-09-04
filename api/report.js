@@ -1,4 +1,4 @@
-// api/report.js — גרסה עצמאית: תמלול + מיפוי דוברים + דו"ח (CommonJS)
+// api/report.js — תמלול + מיפוי דוברים + דו"ח חכם (CommonJS, הכל בקובץ)
 
 // ---------- תמלול (AssemblyAI) ----------
 async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
@@ -6,14 +6,13 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
   if (!API_KEY) throw new Error('Missing AIA_TRANSCRIBE_KEY');
   if (!audioUrl) throw new Error('audioUrl is required');
 
-  // 1) יצירת משימת תמלול עם זיהוי דוברים
   const createRes = await fetch('https://api.assemblyai.com/v2/transcript', {
     method: 'POST',
     headers: { authorization: API_KEY, 'content-type': 'application/json' },
     body: JSON.stringify({
       audio_url: audioUrl,
-      speaker_labels: true,      // זיהוי דוברים
-      language_code: language,   // עברית
+      speaker_labels: true,
+      language_code: language,
       punctuate: true,
       format_text: true
     })
@@ -21,7 +20,6 @@ async function transcribeWithSpeakersInline({ audioUrl, language = 'he' }) {
   if (!createRes.ok) throw new Error('AIA create failed: ' + (await createRes.text()));
   const { id } = await createRes.json();
 
-  // 2) Polling קצר (מתאים לקבצים קצרים ~15–60ש')
   let result, status = 'processing';
   const start = Date.now();
   while (Date.now() - start < 25000) {
@@ -55,16 +53,15 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ---------- עזר: רשימת משתתפים ----------
+// ---------- עזר: רשימת משתתפים (פסיקים/שורות/נקודה-פסיק) ----------
 function parseParticipantsList(participantsText) {
   return String(participantsText || '')
-    // מפרקים לפי: פסיק רגיל, נקודה-פסיק, ירידת שורה, וגם פסיק עברי אם הוזן
-    .split(/[,\u060C;|\n\r]+/)   // \u060C = פסיק ערבי/עברי (،) ליתר ביטחון
+    .split(/[,\u060C;|\n\r]+/)
     .map(s => s.trim())
     .filter(Boolean);
 }
 
-// האם שם אחד מרשימת המשתתפים מופיע בטקסט (מלא או פרטי)
+// האם שם מהרשימה מופיע בטקסט (מלא או פרטי)
 function findNameInText(names, text) {
   const t = String(text || '').toLowerCase();
   for (const name of names) {
@@ -81,7 +78,7 @@ function findNameInText(names, text) {
   return null;
 }
 
-// בונה מיפוי { תווית דובר מקורית -> שם אנושי }
+// מיפוי { תווית מקורית -> שם אנושי } (קודם לפי הופעת שם בטקסט, אח"כ לפי סדר)
 function buildSpeakerMap(segments, participants) {
   const labelsOrder = [];
   const seenLabel = new Set();
@@ -95,7 +92,6 @@ function buildSpeakerMap(segments, participants) {
   const map = {};
   const assignedNames = new Set();
 
-  // שלב א: לפי הופעת שם בטקסט
   for (const s of segments) {
     const label = s.speaker;
     if (map[label]) continue;
@@ -106,7 +102,6 @@ function buildSpeakerMap(segments, participants) {
     }
   }
 
-  // שלב ב: לפי סדר הופעה מול רשימת המשתתפים
   let pIdx = 0;
   for (const label of labelsOrder) {
     if (map[label]) continue;
@@ -117,19 +112,65 @@ function buildSpeakerMap(segments, participants) {
       pIdx++;
     }
   }
-
-  // השארת תווית מקורית למי שלא שובץ
-  for (const label of labelsOrder) {
-    if (!map[label]) map[label] = label;
-  }
+  for (const label of labelsOrder) if (!map[label]) map[label] = label;
   return map;
 }
-
 function applySpeakerMap(segments, speakerMap) {
-  return (segments || []).map(s => ({
-    ...s,
-    speaker: speakerMap[s.speaker] || s.speaker
-  }));
+  return (segments || []).map(s => ({ ...s, speaker: speakerMap[s.speaker] || s.speaker }));
+}
+
+// ---------- דו״ח חכם עם LLM (OpenAI) ----------
+async function generateReportItemsLLM({ transcriptText, meetingTitle, meetingDate }) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('Missing OPENAI_API_KEY');
+
+  // חיסכון: שולחים רק פתיח עד X תווים
+  const MAX_CHARS = 6000;
+  const text = String(transcriptText || '').slice(0, MAX_CHARS);
+
+  const prompt = `
+את/ה עורך/ת דו"חות ישיבות בעברית. קלט: תמלול פגישה בעברית.
+החזר JSON בלבד עם השדות:
+{
+  "items": [
+    { "topic": string, "decisions": string, "owner": string, "due": string }
+  ],
+  "summary": string
+}
+
+הנחיות:
+- "items": 3–8 שורות תכל'ס. קצר ומדויק.
+- אם לא צוין אחראי/לו"ז – השאר "—".
+- ניסוח מקצועי, בעברית תקינה, ללא הקדמות/נימוקים נוספים.
+כותרת: "${meetingTitle || ''}" | תאריך: "${meetingDate || ''}"
+
+תמלול:
+"""${text}"""
+`.trim();
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'authorization': `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'את/ה ממיין/ת תמלול ומחזיר/ה JSON תקין בעברית.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.2
+    })
+  });
+  if (!resp.ok) throw new Error('LLM call failed: ' + (await resp.text()));
+  const data = await resp.json();
+  let out;
+  try {
+    out = JSON.parse(data.choices?.[0]?.message?.content || '{}');
+  } catch {
+    out = { items: [], summary: '' };
+  }
+  if (!Array.isArray(out.items)) out.items = [];
+  return out;
 }
 
 // ---------- ה־Handler הראשי ----------
@@ -141,20 +182,20 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // בדיקת בריאות: מצב דמו ומפתח
+  // בדיקת בריאות
   if (req.method === 'GET') {
     try {
       const demo = String(process.env.DEMO_MODE || 'true').toLowerCase() === 'true';
       const hasTranscribeKey = !!process.env.AIA_TRANSCRIBE_KEY;
-      return res.status(200).json({ ok: true, demo, hasTranscribeKey });
+      const llmMode = String(process.env.LLM_MODE || 'false').toLowerCase() === 'true';
+      const hasOpenAI = !!process.env.OPENAI_API_KEY;
+      return res.status(200).json({ ok: true, demo, hasTranscribeKey, llmMode, hasOpenAI });
     } catch (e) {
       return res.status(500).json({ ok: false, error: String(e?.message || e) });
     }
   }
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
     const {
@@ -166,8 +207,8 @@ module.exports = async function handler(req, res) {
       audioUrl = ''
     } = req.body || {};
 
-    // ניתן גם לשלוט בדמו דרך פרמטר ?demo=true/false אם תרצה (להוסיף בקלות)
     const demo = String(process.env.DEMO_MODE || 'true').toLowerCase() === 'true';
+    const llmMode = String(process.env.LLM_MODE || 'false').toLowerCase() === 'true';
 
     // --- תמלול ---
     let transcript;
@@ -184,18 +225,50 @@ module.exports = async function handler(req, res) {
       transcript = await transcribeWithSpeakersInline({ audioUrl, language: 'he' });
     }
 
-    // --- מיפוי דוברים לשמות מהטופס (עם “חיזוק” לפי שמם בטקסט) ---
-    const participantsList = parseParticipantsList(participants);         // ["אביב", "חיים", ...]
+    // --- מיפוי דוברים ---
+    const participantsList = parseParticipantsList(participants);
     const speakerMap = buildSpeakerMap(transcript.segments || [], participantsList);
     const remappedSegments = applySpeakerMap(transcript.segments || [], speakerMap);
+    const attendees = Array.from(new Set([...participantsList, ...Object.values(speakerMap)]));
 
-    // רשימת נוכחים משולבת (ייחודית)
-    const attendees = Array.from(new Set([
-      ...participantsList,
-      ...Object.values(speakerMap)
-    ]));
+    // --- יצירת פריטי דו"ח חכמים (אופציונלי) ---
+    let items = [
+      { id: 1, topic: 'פתיחה', decisions: 'הצגת מטרות', owner: '—', due: '—' },
+      { id: 2, topic: 'סטטוס', decisions: 'עדכון התקדמות', owner: '—', due: '—' }
+    ];
+    let summary = '';
 
-    // --- HTML דו"ח בסיסי בעברית/RTL ---
+    if (llmMode && !demo) {
+      const { items: aiItems = [], summary: aiSummary = '' } =
+        await generateReportItemsLLM({ transcriptText: transcript.text, meetingTitle, meetingDate });
+
+      // נורמליזציה + הוספת מזהים
+      items = (aiItems || []).slice(0, 8).map((it, idx) => ({
+        id: idx + 1,
+        topic: String(it.topic || '').trim() || '—',
+        decisions: String(it.decisions || '').trim() || '—',
+        owner: String(it.owner || '').trim() || '—',
+        due: String(it.due || '').trim() || '—'
+      }));
+      if (items.length === 0) {
+        items = [
+          { id: 1, topic: 'פתיחה', decisions: '—', owner: '—', due: '—' }
+        ];
+      }
+      summary = String(aiSummary || '').trim();
+    }
+
+    // --- HTML דו"ח ---
+    const tableRows = items.map(r => `
+      <tr>
+        <td>${r.id}</td>
+        <td>${escapeHtml(r.topic)}</td>
+        <td>${escapeHtml(r.decisions)}</td>
+        <td>${escapeHtml(r.owner)}</td>
+        <td>${escapeHtml(r.due)}</td>
+      </tr>
+    `).join('');
+
     const html = `
 <section dir="rtl" style="font-family: system-ui; line-height:1.6; max-width:860px; margin:auto;">
   <h1 style="margin:0 0 12px;">${escapeHtml(meetingTitle)} – סיכום פגישה מתאריך ${escapeHtml(meetingDate)}</h1>
@@ -210,31 +283,28 @@ module.exports = async function handler(req, res) {
     `).join('')}
   </div>
 
-  <h3 style="margin:12px 0 6px;">טבלת נושאים/החלטות/לו"ז (סקיצה)</h3>
+  <h3 style="margin:12px 0 6px;">טבלת נושאים/החלטות/לו"ז ${llmMode && !demo ? '(אוטומטי)' : '(סקיצה)'}</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%;">
     <thead><tr><th>מס'</th><th>נושא</th><th>תיאור/החלטות</th><th>אחראי</th><th>לו"ז</th></tr></thead>
-    <tbody>
-      <tr><td>1</td><td>פתיחה</td><td>הצגת מטרות הפגישה</td><td>—</td><td>—</td></tr>
-      <tr><td>2</td><td>סטטוס</td><td>עדכון התקדמות ותלויות</td><td>—</td><td>—</td></tr>
-    </tbody>
+    <tbody>${tableRows}</tbody>
   </table>
+
+  ${summary ? `<h3 style="margin:12px 0 6px;">תקציר מנהלים</h3><p>${escapeHtml(summary)}</p>` : ''}
 
   <p style="margin-top:10px;">רשם/ת: ${escapeHtml(scribeName || '—')} | תפוצה: ${escapeHtml(distribution || '—')}</p>
   ${demo ? `<p style="font-size:0.9em; color:#666;">(מצב דמו פעיל – ללא עיבוד אמיתי)</p>` : ''}
 </section>`.trim();
 
-    // --- JSON מובנה ---
+    // --- JSON מוחזר ---
     const data = {
       title: `${meetingTitle} – ${meetingDate}`,
       attendees: attendees.map(name => ({ name })),
-      items: [
-        { id: 1, topic: 'פתיחה', decisions: 'הצגת מטרות', owner: '', due: '' },
-        { id: 2, topic: 'סטטוס', decisions: 'עדכון התקדמות', owner: '', due: '' }
-      ],
+      items,
       transcript: {
-        speakers: attendees,               // שמות אחרי מיפוי
-        segments: remappedSegments         // כל סגמנט עם speaker ממופה
+        speakers: attendees,
+        segments: remappedSegments
       },
+      summary,
       footer: { scribeName, distribution }
     };
 
