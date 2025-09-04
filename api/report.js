@@ -57,8 +57,9 @@ function escapeHtml(s) {
 
 // ---------- עזר: רשימת משתתפים ----------
 function parseParticipantsList(participantsText) {
-  return (participantsText || '')
-    .split('\n')
+  return String(participantsText || '')
+    // מפרקים לפי: פסיק רגיל, נקודה-פסיק, ירידת שורה, וגם פסיק עברי אם הוזן
+    .split(/[,\u060C;|\n\r]+/)   // \u060C = פסיק ערבי/עברי (،) ליתר ביטחון
     .map(s => s.trim())
     .filter(Boolean);
 }
